@@ -13,15 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use anyhow::{anyhow, Context, Result};
-use indicatif::ProgressBar;
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashSet,
-    io::{BufRead, BufReader, Seek, SeekFrom, Write},
-    path::Path,
-};
+use anyhow::{anyhow, Result};
+use serde::Serialize;
+use std::{io::Write, path::PathBuf};
 use wasmbin::{
     builtins::Blob,
     sections::{ExportDesc, FuncBody, ImportDesc, Section},
@@ -75,11 +69,6 @@ struct SizeStats {
     custom: usize,
     descriptors: usize,
     total: usize,
-    total_br: usize,
-    total_strip: usize,
-    total_strip_br: usize,
-    total_opt: usize,
-    total_opt_br: usize,
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -91,8 +80,7 @@ struct ExternalStats {
 }
 
 #[derive(Default, Debug, Serialize)]
-struct Stats<'a> {
-    filename: &'a str,
+struct Stats {
     funcs: usize,
     instr: InstructionStats,
     size: SizeStats,
@@ -463,84 +451,16 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
     Ok(stats)
 }
 
-fn path_to_filename(path: &Path) -> Result<&str> {
-    path.file_name()
-        .context("Missing filename")?
-        .to_str()
-        .context("Invalid filename")
-}
-
-fn file_size(path: impl AsRef<Path>) -> Result<usize> {
-    let path = path.as_ref();
-    std::fs::metadata(path)
-        .map(|metadata| metadata.len() as _)
-        .with_context(move || path_to_filename(path).unwrap_or("(no filename)").to_owned())
-}
-
 fn main() -> Result<()> {
-    let dir = std::env::args_os()
+    let path_str = std::env::args_os()
         .nth(1)
-        .ok_or_else(|| anyhow!("Please provide directory"))?;
-
-    let mut output = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(Path::new(&dir).join("stats.json"))?;
-
-    output.seek(SeekFrom::Start(0))?;
-
-    let prev_files = BufReader::new(&mut output)
-        .lines()
-        .map(|line| -> Result<_> {
-            #[derive(Deserialize)]
-            struct QuickStats {
-                filename: String,
-            }
-
-            Ok(serde_json::from_str::<QuickStats>(&line?)?.filename)
-        })
-        .collect::<Result<HashSet<_>>>()?;
-
-    let new_files = std::fs::read_dir(&dir)?
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("wasm"))
-        .filter(|path| !prev_files.contains(path_to_filename(path).unwrap()))
-        .collect::<Vec<_>>();
-
-    let pb = ProgressBar::new((prev_files.len() + new_files.len()) as _);
-
-    pb.inc(prev_files.len() as _);
-
-    let output = std::sync::Mutex::new(std::io::BufWriter::new(output));
-
-    let errors = new_files
-        .into_par_iter()
-        .filter_map(|path| {
-            let filename = path_to_filename(&path).unwrap().to_owned();
-            let handler = || -> Result<()> {
-                let wasm = std::fs::read(&path)?;
-                let mut stats = get_stats(&wasm)?;
-                stats.filename = &filename;
-                stats.size.total_br = file_size(path.with_extension("wasm.br"))?;
-                stats.size.total_strip = file_size(path.with_extension("wasm.strip"))?;
-                stats.size.total_strip_br = file_size(path.with_extension("wasm.strip.br"))?;
-                stats.size.total_opt = file_size(path.with_extension("wasm.opt"))?;
-                stats.size.total_opt_br = file_size(path.with_extension("wasm.opt.br"))?;
-                // Serialize to string to ensure atomic write of an entire line.
-                let serialized = serde_json::to_string(&stats)? + "\n";
-                output.lock().unwrap().write_all(serialized.as_bytes())?;
-                Ok(())
-            };
-            let result = handler();
-            pb.inc(1);
-            Some(result.err()?.context(filename))
-        })
-        .collect::<Vec<_>>();
-
-    if !errors.is_empty() {
-        anyhow::bail!("Multiple errors: {:#?}", errors);
-    }
+        .ok_or_else(|| anyhow!("Please provide wasm file path"))?;
+    let path = PathBuf::from(&path_str);
+    let abs_path = std::fs::canonicalize(&path)?;
+    let wasm = std::fs::read(&abs_path)?;
+    let stats = get_stats(&wasm)?;
+    let serialized = serde_json::to_string(&stats)? + "\n";
+    std::io::stdout().write_all(serialized.as_bytes())?;
 
     Ok(())
 }
