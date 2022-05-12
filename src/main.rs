@@ -464,3 +464,25 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_stats_funcs() -> Result<()> {
+        let wat = r#"
+        (module
+            (func $foo)
+            (func (export "bar")
+                call $foo
+            )
+        )
+        "#;
+        let binary = wat::parse_str(wat)?;
+        let stats = get_stats(&binary[..])?;
+        // TODO: test more of the stats
+        assert_eq!(stats.funcs, 2);
+        Ok(())
+    }
+}
