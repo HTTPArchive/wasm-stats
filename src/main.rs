@@ -381,14 +381,6 @@ fn infer_language(module: &wasmbin::Module) -> Result<Language> {
         return Ok(Language::Rust);
     }
 
-    // OK, so this one is *very* hacky! The hyphenate lib (https://github.com/mnater/Hyphenopoly) is found on a number of
-    // websites. It is written in AssemblyScript, and has a variety of different bundles. They all export the function
-    // 'hyphenate'.
-    // There is no other clear way of detecting AssemblyScript :-(
-    if exports.iter().any(|e| e.name == "hyphenate") {
-        return Ok(Language::AssemblyScript);
-    }
-
     // Many of the wasm modules have been compressed with this very distinctive pattern. From looking at a number of wasm modules
     // and inspecting their contents, or the page that hosts them, it seems quite likely this is Emscripten. For example:
     //
@@ -690,22 +682,6 @@ mod tests {
         "#,
         )?;
         assert_eq!(stats.language, Language::Go);
-        Ok(())
-    }
-
-    #[test]
-    fn infer_language_assemblyscript() -> Result<()> {
-        // b796c7ed881e2daa89592c4c72cb4e986a5a8ffb57e8cf345f523c3fb5c0af6a.wasm
-        let stats = stats_from_wat(
-            r#"
-        (module
-            (type $t1 (func (param i32 i32 i32)))
-            (func $hyphenate (type $t1) (param $p0 i32) (param $p1 i32) (param $p2 i32))
-            (export "hyphenate" (func $hyphenate))
-        )
-        "#,
-        )?;
-        assert_eq!(stats.language, Language::AssemblyScript);
         Ok(())
     }
 
