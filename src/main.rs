@@ -38,6 +38,25 @@ struct ProposalStats {
     bigint_externals: usize,
 }
 
+#[derive(Serialize, Eq, PartialEq, Hash, Debug)]
+enum Language {
+    Rust,
+    Emscripten,
+    // a category for WebAssembly modules where there is some evidence that
+    // it is Emscripten, but the methods used are not terribly reliable.
+    LikelyEmscripten,
+    AssemblyScript,
+    Blazor,
+    Unknown,
+    Go,
+}
+
+impl Default for Language {
+    fn default() -> Self {
+        Language::Unknown
+    }
+}
+
 #[derive(Default, Debug, Serialize)]
 struct InstructionCategoryStats {
     load_store: usize,
@@ -82,6 +101,7 @@ struct ExternalStats {
 #[derive(Default, Debug, Serialize)]
 struct Stats {
     funcs: usize,
+    language: Language,
     instr: InstructionStats,
     size: SizeStats,
     imports: ExternalStats,
@@ -315,6 +335,81 @@ impl<T> MaybeExternal<T> {
     }
 }
 
+fn infer_language(module: &wasmbin::Module) -> Result<Language> {
+    let mut imports = Vec::new();
+    let mut exports = Vec::new();
+
+    for section in &module.sections {
+        match section {
+            Section::Import(section) => {
+                let section = section.try_contents()?;
+                for import in section {
+                    imports.push(&import.path);
+                }
+            }
+            Section::Export(section) => {
+                let section = section.try_contents()?;
+                for export in section {
+                    exports.push(export);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // NOTE: Need to check for Blazor ahead of Emscripten
+    if imports.iter().any(|i| i.name.contains("blazor")) {
+        return Ok(Language::Blazor);
+    }
+
+    if imports.iter().any(|i| i.name.contains("emscripten")) {
+        return Ok(Language::Emscripten);
+    }
+
+    if imports.iter().any(|i| i.module == "go") {
+        return Ok(Language::Go);
+    }
+
+    // these are all based on Rust using wasm-bindgen
+    if imports.iter().any(|i| {
+        i.name.contains("wbindgen")
+            || i.name.contains("wbg")
+            || i.module == "wbg"
+            || i.module == "wbindgen"
+    }) || exports.iter().any(|e| e.name.contains("wbindgen"))
+    {
+        return Ok(Language::Rust);
+    }
+
+    // Many of the wasm modules have been compressed with this very distinctive pattern. From looking at a number of wasm modules
+    // and inspecting their contents, or the page that hosts them, it seems quite likely this is Emscripten. For example:
+    //
+    // https://tweet2doom.github.io/t2d-explorer.wasm
+    //   => https://github.com/tweet2doom/tweet2doom.github.io - strong evidence of Emscripten
+    //
+    // https://graphonline.ru/script/Graphoffline.Emscripten.wasm - the clue is in the filename!
+    //
+    // https://wsr-starfinder.com/js/stellarium-web-engine.06229ae9.wasm
+    //  => https://github.com/Stellarium/stellarium-web-engine - code makes reference to using Emscripten
+    if (imports.iter().any(|i| i.module == "a" && i.name == "a")
+        && imports.iter().any(|i| i.module == "a" && i.name == "b"))
+
+    // another distinctive pattern, again, evidence suggests Emscripten
+    // https://tx.me/
+    // => https://github.com/Samsung/rlottie/blob/master/src/wasm/rlottiewasm.cpp - this is a cool project ;-)
+    //
+    // https://demo.harmonicvision.com - Emscripten mentioned in the page source
+    //
+    // https://webcamera.io - uses FFMpeg, which is an Emscripten project
+    || (imports.iter().any(|i| i.module == "env" && i.name == "a")
+        && imports.iter().any(|i| i.module == "env" && i.name == "b"))
+    {
+        return Ok(Language::LikelyEmscripten);
+    }
+
+    Ok(Language::Unknown)
+}
+
 fn get_stats(wasm: &[u8]) -> Result<Stats> {
     let m = wasmbin::Module::decode_from(wasm)?;
     let mut stats = Stats {
@@ -322,6 +417,7 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
             total: wasm.len(),
             ..Default::default()
         },
+        language: infer_language(&m)?,
         ..Default::default()
     };
     let mut global_types = Vec::new();
@@ -463,4 +559,158 @@ fn main() -> Result<()> {
     std::io::stdout().write_all(serialized.as_bytes())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats_from_wat(wat: &str) -> Result<Stats> {
+        let binary = wat::parse_str(wat)?;
+        get_stats(&binary[..])
+    }
+
+    #[test]
+    fn get_stats_funcs() -> Result<()> {
+        let stats = stats_from_wat(
+            r#"
+        (module
+            (func $foo)
+            (func (export "bar")
+                call $foo
+            )
+        )
+        "#,
+        )?;
+        // TODO: test more of the stats
+        assert_eq!(stats.funcs, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn infer_language_unknown() -> Result<()> {
+        let stats = stats_from_wat("(module)")?;
+        assert_eq!(stats.language, Language::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn infer_language_rust() -> Result<()> {
+        // b63e9f90187a9f5cec9a7a9cfc15e68e9330979ac39a29258282c020780cd6ec.wasm
+        //
+        // exports mention 'wbindgen'
+        let stats = stats_from_wat(
+            r#"
+        (module
+            (type $t8 (func (param i32)))
+            (func $__wbindgen_malloc (type $t8) (param $p0 i32))
+            (export "__wbindgen_malloc" (func $__wbindgen_malloc))
+        )
+        "#,
+        )?;
+        assert_eq!(stats.language, Language::Rust);
+
+        // 82f052ee941598c3f70b9adfdebcb8fda239e5095e48d3e4a2edcc208b0c769c.wasm
+        //
+        // import references a 'wbg' module
+        let stats = stats_from_wat(
+            r#"
+        (module
+            (type $t2 (func (param i32)))
+            (import "wbg" "__wbindgen_object_drop_ref" (func $wasm_bindgen::__wbindgen_object_drop_ref::hc5b72d1598c36103 (type $t2)))
+        )
+        "#,
+        )?;
+        assert_eq!(stats.language, Language::Rust);
+
+        // d792c9bfa765ab3e849bb2f266e1d2b19e555fc4a59c51d22a47fa73b27180b8.wasm
+        //
+        // import references a function containing 'wbg'
+        let stats = stats_from_wat(
+            r#"
+        (module
+            (type $t11 (func (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+            (import "./source_compiler_bg.js" "__wbg_sourcerorLogCallback_9555c6dd7a1fa2a1" (func $./source_compiler_bg.js.__wbg_sourcerorLogCallback_9555c6dd7a1fa2a1 (type $t11)))
+        )
+        "#,
+        )?;
+        assert_eq!(stats.language, Language::Rust);
+        Ok(())
+    }
+
+    #[test]
+    fn infer_language_blazor() -> Result<()> {
+        // 9bd69204e55c94eb68b385ed4f79dffc752dc8fbccd526fd5c61d13a5df5d5de.wasm
+        let stats = stats_from_wat(
+            r#"
+        (module
+            (type $t4 (func (param i32 i32 i32) (result i32)))
+            (type $t8 (func (param i32 i32 i32 i32 i32) (result i32)))
+            (import "env" "mono_wasm_invoke_js_blazor" (func $env.mono_wasm_invoke_js_blazor (type $t8)))
+            (import "env" "emscripten_asm_const_int" (func $env.emscripten_asm_const_int (type $t4)))
+        )
+        "#,
+        )?;
+        assert_eq!(stats.language, Language::Blazor);
+        Ok(())
+    }
+
+    #[test]
+    fn infer_language_emscripten() -> Result<()> {
+        // 70c2f8e0269dd409da3153196ee3e4258f196d313ea271b1516c7fc241c52adb.wasm
+        let stats = stats_from_wat(
+            r#"
+        (module
+            (type $t3 (func (param i32) (result i32)))
+            (import "env" "_emscripten_asm_const_i" (func $env._emscripten_asm_const_i (type $t3)))
+        )
+        "#,
+        )?;
+        assert_eq!(stats.language, Language::Emscripten);
+        Ok(())
+    }
+
+    #[test]
+    fn infer_language_go() -> Result<()> {
+        // 1b98798659012dc524343d1a44da2488fb09436fd6ca587c804ad272367d294d.wasm
+        let stats = stats_from_wat(
+            r#"
+        (module
+            (type $t1 (func (param i32)))
+            (import "go" "runtime.resetMemoryDataView" (func $go.runtime.resetMemoryDataView (type $t1)))
+        )
+        "#,
+        )?;
+        assert_eq!(stats.language, Language::Go);
+        Ok(())
+    }
+
+    #[test]
+    fn infer_language_likely_emscripten() -> Result<()> {
+        // 38049c6cc89d4c6ac8c2635fc0af29901109d68247ba7e57d2bff551216a322e.wasm
+        let stats = stats_from_wat(
+            r#"
+        (module
+            (type $t4 (func (param i32 i32 i32) (result i32)))
+            (import "a" "a" (func $a.a (type $t4)))
+            (import "a" "b" (func $a.b (type $t4)))
+        )
+        "#,
+        )?;
+        assert_eq!(stats.language, Language::LikelyEmscripten);
+
+        // f50ed354fd14cce39533af5fc58c0e4387a326748114c57a2ce3c98611da673b.wasm
+        let stats = stats_from_wat(
+            r#"
+        (module
+            (type $t6 (func (param i32 i32 i32 i32)))
+            (import "env" "b" (func $env.b (type $t6)))
+            (import "env" "a" (global $env.a i32))
+        )
+        "#,
+        )?;
+        assert_eq!(stats.language, Language::LikelyEmscripten);
+
+        Ok(())
+    }
 }
