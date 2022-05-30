@@ -336,8 +336,8 @@ impl<T> MaybeExternal<T> {
 }
 
 fn infer_language(module: &wasmbin::Module) -> Result<Language> {
-    let mut imports = vec![];
-    let mut exports = vec![];
+    let mut imports = Vec::new();
+    let mut exports = Vec::new();
 
     for section in &module.sections {
         match section {
