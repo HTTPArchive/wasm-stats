@@ -13,4 +13,4 @@ $ cargo run --release -- module.wasm
 
 wasm-stats profiles the wasm modules in an attempt to determine the original source language. This is not an exact science! Some are easy to spot, e.g. mention of specific technologies in imports / exports, whereas others are harder to determine.
 
-The methods used in this tool have been tested on a recent crawl (with ~1,000 modules), and the inference techniques developed manually / iteratively. They have been developed within the following project: https://github.com/ColinEberhardt/wasm-lang-inferences
+The methods used in this tool have been tested on a recent crawl (with ~1,000 modules), and the inference techniques developed manually / iteratively. They have been developed within the following project: https://github.com/ColinEberhardt/wasm-lang-inference
